@@ -1,0 +1,121 @@
+//@version=5
+const float COMMISSION_PCT = 0.04
+const int SLIPPAGE_TICKS = 1
+// TradingView requires commission_value (float) and slippage (int) in strategy() to be compile-time constants.
+strategy("Trend Pullback ATR (Futures) - Balanced (No Repaint)", overlay=true, pyramiding=0, process_orders_on_close=true, calc_on_every_tick=false, commission_type=strategy.commission.percent, commission_value=COMMISSION_PCT, slippage=SLIPPAGE_TICKS)
+
+// =========================
+// Inputs
+// =========================
+riskPct = input.float(1.0, "Risk % Per Trade", minval=0.1, step=0.1)
+rr = input.float(1.8, "Risk-Reward (RR)", minval=0.5, step=0.1)
+useBreakEven = input.bool(true, "Enable Break-Even at +1R")
+useAtrTrail = input.bool(true, "Enable ATR Trailing Stop")
+
+useDateFilter = input.bool(false, "Enable Date Filter")
+fromTime = input.time(timestamp("2021-01-01T00:00:00"), "From Time")
+toTime = input.time(timestamp("2099-12-31T23:59:59"), "To Time")
+inDate = not useDateFilter or (time >= fromTime and time <= toTime)
+
+// =========================
+// Core calculations
+// =========================
+emaTrendLen = 200
+emaPullbackLen = 21
+adxLen = 14
+atrLen = 14
+minAdx = 18.0
+minAtrPct = 0.25
+
+ema200 = ta.ema(close, emaTrendLen)
+ema21 = ta.ema(close, emaPullbackLen)
+adxVal = ta.adx(adxLen)
+atrVal = ta.atr(atrLen)
+atrPct = close != 0.0 ? (atrVal / close) * 100.0 : 0.0
+
+uptrend = close > ema200 and ema21 > ema200
+downtrend = close < ema200 and ema21 < ema200
+
+adxFilter = adxVal >= minAdx
+atrFilter = atrPct >= minAtrPct
+
+// Pullback + close confirmation conditions
+longPullbackConfirm = uptrend and low < ema21 and ta.crossover(close, ema21)
+shortPullbackConfirm = downtrend and high > ema21 and ta.crossunder(close, ema21)
+
+// No repaint: only trigger on confirmed bar close
+longSignal = barstate.isconfirmed and inDate and adxFilter and atrFilter and longPullbackConfirm
+shortSignal = barstate.isconfirmed and inDate and adxFilter and atrFilter and shortPullbackConfirm
+
+// =========================
+// Risk-based position sizing
+// =========================
+stopDist = atrVal * 2.2
+riskCash = strategy.equity * (riskPct / 100.0)
+qtyRaw = stopDist > 0.0 ? (riskCash / stopDist) : 0.0
+qty = math.max(qtyRaw, 0.0)
+
+// =========================
+// Entries
+// =========================
+if longSignal and strategy.position_size <= 0 and qty > 0
+    strategy.entry("Long", strategy.long, qty=qty)
+
+if shortSignal and strategy.position_size >= 0 and qty > 0
+    strategy.entry("Short", strategy.short, qty=qty)
+
+// =========================
+// Dynamic exit management (Base SL/TP + optional BE + optional ATR trail)
+// =========================
+var float highSinceEntry = na
+var float lowSinceEntry = na
+
+if strategy.position_size > 0
+    highSinceEntry := na(highSinceEntry) ? high : math.max(highSinceEntry, high)
+    lowSinceEntry := na
+else if strategy.position_size < 0
+    lowSinceEntry := na(lowSinceEntry) ? low : math.min(lowSinceEntry, low)
+    highSinceEntry := na
+else
+    highSinceEntry := na
+    lowSinceEntry := na
+
+if strategy.position_size > 0 and stopDist > 0
+    longEntry = strategy.position_avg_price
+    baseStopLong = longEntry - stopDist
+    tpLong = longEntry + (stopDist * rr)
+
+    beActiveLong = useBreakEven and high >= (longEntry + stopDist)
+    beStopLong = beActiveLong ? longEntry : baseStopLong
+
+    trailDist = atrVal * 2.5
+    trailStopLong = useAtrTrail and not na(highSinceEntry) ? (highSinceEntry - trailDist) : baseStopLong
+
+    // For longs, choose the tightest (highest) valid stop among base/BE/trail.
+    finalStopLong = math.max(baseStopLong, beStopLong)
+    finalStopLong := useAtrTrail ? math.max(finalStopLong, trailStopLong) : finalStopLong
+
+    strategy.exit("Long Exit", "Long", stop=finalStopLong, limit=tpLong)
+
+if strategy.position_size < 0 and stopDist > 0
+    shortEntry = strategy.position_avg_price
+    baseStopShort = shortEntry + stopDist
+    tpShort = shortEntry - (stopDist * rr)
+
+    beActiveShort = useBreakEven and low <= (shortEntry - stopDist)
+    beStopShort = beActiveShort ? shortEntry : baseStopShort
+
+    trailDist = atrVal * 2.5
+    trailStopShort = useAtrTrail and not na(lowSinceEntry) ? (lowSinceEntry + trailDist) : baseStopShort
+
+    // For shorts, choose the tightest (lowest) valid stop among base/BE/trail.
+    finalStopShort = math.min(baseStopShort, beStopShort)
+    finalStopShort := useAtrTrail ? math.min(finalStopShort, trailStopShort) : finalStopShort
+
+    strategy.exit("Short Exit", "Short", stop=finalStopShort, limit=tpShort)
+
+// =========================
+// Plots
+// =========================
+plot(ema200, "EMA 200", color=color.new(color.blue, 0), linewidth=2)
+plot(ema21, "EMA 21", color=color.new(color.orange, 0), linewidth=2)
